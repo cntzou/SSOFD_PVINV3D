@@ -1,0 +1,1404 @@
+function u=SSOFD_PVINV3D_LocUpdate(n,JL,JI,JR,n_intpts,bhat,intxyz,qd,uGuess)
+% bhat does not divide by h^2
+
+SHOW=0;
+Showcount=1;
+showfig=0;
+MACHINE=0;      % 0=Mac(Local) 1=Linux(Server)
+MAXITER=1000;   % Maximum iterations
+ANDERSON=1;     % With relaxation = 1; Without relaxation = 0;
+USEGFM = 1;     % For initial guess of u: Use tom solution = 0; Use GFM = 1;
+                % USEGFM = 2: Skip GFM
+myr=0.9;
+
+[Lr2, ~, DM, ~] = PARMS;
+
+fprintf('Note: JR is recording the (xI-x(i-1)) instead of (xI-x(i)) when crossing west\n')
+fprintf('Lr2=%.4f\n',Lr2)
+fprintf('DM=%.4f\n', DM )
+fprintf('interface location detection into a loop for SSOFD\n')
+%fprintf('Note: search NOR3, should use N3\n')
+
+
+%For test purposes
+xint=intxyz(:,:,1);
+xint=reshape(xint,[],1);
+yint=intxyz(:,:,2);
+yint=reshape(yint,[],1);
+zint=intxyz(:,:,3);
+zint=reshape(zint,[],1);
+
+if showfig==1
+figure(100)
+scatter3( xint,yint,zint,'MarkerEdgeColor','k',...
+                         'MarkerFaceColor','c'...
+                        ,'MarkerFaceAlpha',.5)
+xlabel('x');   ylabel('y');   zlabel('z');
+title('Linearly interpolated interface points')
+set(gca,'XLim',[0 1],'YLim',[0 1],'ZLim',[0 1])
+end
+%For test purposes
+
+
+
+
+%^^ Setup geometry
+[xini, xter, yini, yter, zini, zter]=DOMAIN;
+
+nx=n;                   ny=n;                   nz=n;                               %setup # of grid points in each direction
+dx=(xter-xini)/(nx-1);  dy=(yter-yini)/(ny-1);  dz=(zter-zini)/(nz-1);              %dx, dy and dz
+x=xini:dx:xter;         y=yini:dy:yter;         z=zini:dz:zter;                     %Range of z and specifying the grid points
+
+Nl=(nx-1)*(ny-1)*nz;                                                                %Grid without x=1, y=1.
+
+u=zeros(nx,ny,nz);
+Dxyz=[dz,dy,dx,dx,dy,dz];
+%-- Setup geometry
+
+%^^ Exact solution for initial guess
+[X1,X2,X3]=ndgrid(x,y,z);
+Exsol=EXSOL_P(X1,X2,X3);
+%-- Exact solution for initial guess
+
+%^^ Setup GFM boundary conditions (As Au=F only computes at inner grid pts)
+%uGFM=u;
+uGFM=uGuess;
+%__ Setup GFM boundary conditions (As Au=F only computes at inner grid pts)
+
+
+%^^ Preallocate interfacial values
+    enum_nei=zeros(n_intpts,6);
+    neighborindex=zeros(n_intpts,6,3);
+    uint=zeros(n_intpts,6);                  buxyz=zeros(n_intpts,6);
+%-------------------------------------------- Preallocate interfacial values --------------------------------------------
+
+%-- Preallocate interfacial values
+
+% % % % % %find l(i,j,k,n) index for uint location and uint neighbor
+for ii=1:n_intpts
+    for jj=1:6
+        I=JI(ii,1);     J=JI(ii,2);     K=JI(ii,3);
+        if JR(ii,jj)~=0
+        [iii, jjj, kkk]=nei_ind(jj,I,J,K);                                  %Find neighboring 3d-index on opposite side of interface
+                                                                            %(BTSNWE)
+        neighborindex(ii,jj,1:3)=[iii jjj kkk];                             %store neighboring 3d-index on the other side of interface
+        enum_nei(ii,jj)=find( JI(:,1)==iii & JI(:,2)==jjj & JI(:,3)==kkk ); %Find corresponding array index of the whole map
+        end
+    end
+end
+
+% Find neighboring points for the purpose of computing u_tau
+utau1map=zeros(n_intpts,6,9);
+utau2map=zeros(n_intpts,6,9);
+TanMarker=zeros(n_intpts,6);
+% Nor_Err=zeros(n_intpts,6,3);
+
+deta=    zeros(n_intpts,6);
+deta2=   zeros(n_intpts,6);
+
+tau1=    zeros(n_intpts,6,3);
+tau2=    zeros(n_intpts,6,3);
+%nerr=    zeros(n_intpts,6);
+
+% pt=1;
+for ii=1:n_intpts
+    for jj=1:6
+        I=JI(ii,1); J=JI(ii,2);K=JI(ii,3);
+        if JR(ii,jj)~=0
+            %Tii=ii;     Tjj=jj;
+            %%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%% utau1 %%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+            utau1map(ii,jj,1:9)=TAU12MAP(I,J,K,ii,jj,x,y,z,JI,intxyz,1,qd);
+            %fprintf('in SSOFD_PVINV3D_LocUpdate, line 105, ii, jj = %d, %d\n',ii,jj)
+            %%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%% utau1 %%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+
+            %%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%% utau2 %%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+            utau2map(ii,jj,1:9)=TAU12MAP(I,J,K,ii,jj,x,y,z,JI,intxyz,2,qd);
+            %%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%% utau2 %%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+
+            %%%%%%%%%%%%%%%%%%%%%%%%%%%%%% tau_1 %%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+            ip=utau1map(ii,jj,1);   jp=utau1map(ii,jj,2);
+            in=utau1map(ii,jj,3);   jn=utau1map(ii,jj,4);
+            
+            C1=utau1map(ii,jj,5);   C2=utau1map(ii,jj,6);   C3=utau1map(ii,jj,7);
+            deta(ii,jj)=utau1map(ii,jj,8);
+            temptau1=zeros(1,3);
+            
+            Parm = utau1map(ii,jj,9);
+            Cnst = ( (jj==1)+(jj==6) )*2 + ...
+                   ( (jj==2)+(jj==5) )*1 + ...
+                   ( (jj==3)+(jj==4) )*3 ;
+            Imag = 6 - Parm - Cnst;
+            
+            temptau1( Imag ) = [C1 C2 C3]*[intxyz(ip,jp,Imag),intxyz(ii,jj,Imag),intxyz(in,jn,Imag)]';
+            temptau1( Cnst ) = 0;
+            temptau1( Parm ) = 1;            
+            
+            %%%%%%%%%%%%%%%%%%%%%%%%%%%%%% tau_2 %%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+            ip=utau2map(ii,jj,1);   jp=utau2map(ii,jj,2);
+            in=utau2map(ii,jj,3);   jn=utau2map(ii,jj,4);
+            C1=utau2map(ii,jj,5);   C2=utau2map(ii,jj,6);   C3=utau2map(ii,jj,7);
+            deta2(ii,jj)=utau2map(ii,jj,8);
+            
+            temptau2=zeros(1,3);
+            
+            Parm = utau2map(ii,jj,9);
+            Cnst = ( (jj==1)+(jj==6) )*1 + ...
+                   ( (jj==2)+(jj==5) )*3 + ...
+                   ( (jj==3)+(jj==4) )*2 ;
+            Imag = 6 - Parm - Cnst;
+            
+            temptau2( Imag ) = [C1,C2,C3]*[intxyz(ip,jp,Imag),intxyz(ii,jj,Imag),intxyz(in,jn,Imag)]';
+            temptau2( Cnst ) = 0;
+            temptau2( Parm ) = 1;
+            
+            
+            %%%%%%%%%%%%%%%%%%%%%%%%%%%%%%  normal  %%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+            
+            tau1(ii,jj,1:3)=temptau1/norm(temptau1);
+            tau2(ii,jj,1:3)=temptau2/norm(temptau2);            
+
+            app_n=cross(temptau2,temptau1);
+
+            % Adjust to outward pointing normal
+            app_n=app_n*(...
+                         ( ( -sign( app_n(1) ) )*(jj==3) + ( sign( app_n(1) ) )*(jj==4) )*sign(intxyz(ii,jj,1)-x(I)) +...
+                         ( ( -sign( app_n(2) ) )*(jj==2) + ( sign( app_n(2) ) )*(jj==5) )*sign(intxyz(ii,jj,2)-y(J)) +...
+                         ( ( -sign( app_n(3) ) )*(jj==1) + ( sign( app_n(3) ) )*(jj==6) )*sign(intxyz(ii,jj,3)-z(K)) ...
+                        );
+            app_n=app_n/norm(app_n);
+            
+            % Replace Exact Normal by APPROXIMATED Normal
+            % Ref:APPROXIMATED Normal
+            intxyz(ii,jj,4:6)=app_n;
+            
+            if isnan(intxyz(ii,jj,6))==1
+                fprintf('(Paused) tangential has a problem @ %.2f, %.2f, %.2f\n', x(I), y(J), z(K) )
+                fprintf('temptau1 = %.2f, %.2f, %.2f\n', temptau1)
+                fprintf('temptau2 = %.2f, %.2f, %.2f\n', temptau2)
+                fprintf('C1, C2, C3 = %.2f, %.2f, %.2f\n', C1, C2, C3)
+                pause
+            end
+            
+            %%%%%%%% if normal direction almost parallel to x, y or z, ignore %%%%%%%%%
+            if ( max( abs(app_n) ) > 1 - dx/2 )                             % for debug
+                TanMarker(ii,jj)=1;
+            31;
+            end
+            %%%%%%%% if normal direction almost parallel to x, y or z, ignore %%%%%%%%% 
+        end
+    end
+end
+
+
+%[cor3d,intcor] = GFMCORS(JI,JR,bhat./(Dxyz.^2),n_intpts,intxyz,x,y,z,qd);
+cor3d = GFMCORS(JI,JR,bhat./(Dxyz.^2),n_intpts,intxyz,x,y,z,qd);
+
+% ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ Create A ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+%Generate A before running the iterations since the only updates in iterations are the external forces.
+
+[A,F]=SymA3D(n,x,y,z,nx,ny,nz,Nl,qd,intxyz,JI);
+
+% %--------- Check Matrix A (Top)--------%
+if (max(max(max(A-A')))/max(max(max((abs(A)))))>10^-12)
+    fprintf('A is not symmetric, A-A=\n');
+    fprintf('Relative error=%e\n\n',max(max(max(full(A-A'))))/max(max(max((abs(full(A)))))))
+    sparse(A-A')
+    pause
+    return
+else
+    %Symmetrize A
+    A=triu(A,1)'+triu(A);
+end
+% %--------- Check Matrix A (Bottom)--------%
+% -------------------------------------------- Create A -------------------------------------------- 
+if USEGFM == 1
+%^^ Create F and solve by GFM
+    F_GFM=F;                                                               %Assign F values for standard Cartesian points
+
+    for ii=1:n_intpts
+        %F with interfacial corrections involved and then WEIGHTED
+        %F_GFM(JL(ii),1)=F(JL(ii),1)*( 2 - JR(ii,1)- JR(ii,6) )/2+cor3d(ii);
+
+        %F_GFM(JL(ii),1)=F(JL(ii),1)*( 2 - JR(ii,1)- JR(ii,6) )/2+...
+        %cor3d(ii)+fcor3d(ii);
+
+        % Actual GFM
+        F_GFM(JL(ii)) = F(JL(ii)) + cor3d(ii);
+    end
+        
+    [utempGFM,~,~,niter] = pcg(-A,-F_GFM,10^-8,n^2);
+    fprintf('n=%d, CG iteration count (GFM)=%d\n',n,niter) 
+
+    %^^ put solution back into grid
+        for ii=1:nx-1
+            for jj=1:ny-1
+                for kk=1:nz
+                    uGFM(ii,jj,kk)=utempGFM(l(ii,jj,kk,n));
+                end
+            end
+        end
+    %-- put solution back into grid
+
+    uGFM(n,:,:)=uGFM(1,:,:);        %Assign (x=1 value) = (x=0 value)
+    uGFM(:,n,:)=uGFM(:,1,:);        %Assign (y=1 value) = (y=0 value)
+
+    % shift=uGFM(1,1,1)-Exsol(1,1,1);
+    shift=uGFM(1,1,1);
+    uGFM=uGFM-shift*ones(nx,ny,nz); 
+%__Create F and solve by GFM
+  
+%^^ Test 0th Iteration (GFM)
+    uinf_0=max(max(max(abs(uGFM-Exsol))));                                 %L\inf norm
+    u1_0=sum(sum(sum(abs(uGFM-Exsol)))*dx*dy*dz);                          %L1 norm
+    u2_0=sqrt(sum(sum(sum((uGFM-Exsol).^2))*dx*dy*dz));                    %L2 norm
+%-- Test 0th Iteration (GFM)
+
+fprintf('|u_GFM-u|:\n')
+fprintf('Err_inf=%e, Err_1=%e, Err_2=%e\n',uinf_0,u1_0,u2_0)
+
+else
+%^^ Rather than using u_GFM, use u_Tom
+    F_GFM=F;                                                               %Assign F values for standard Cartesian points
+    niter = 1;
+    for ii=1:n_intpts
+        F_GFM(JL(ii))=F(JL(ii)) + cor3d(ii);
+    end
+
+    utempGFM = zeros(Nl,1);
+        for ii=1:nx-1
+            for jj=1:ny-1
+                for kk=1:nz
+                    utempGFM(l(ii,jj,kk,n)) = uGFM(ii,jj,kk);
+                end
+            end
+        end
+%__ Rather than using u_GFM, use u_Tom
+end
+
+
+% For using GFM only
+u = uGFM;
+%upre = uGFM;
+
+%^^ Setup repair map for (bu_x)_x (bu_y)_y and (bu_z)_z
+    bulap = zeros(n_intpts,3);
+    Repair = zeros(n_intpts,5);
+    for ii=1:n_intpts
+    I=JI(ii,1);     J=JI(ii,2);     K=JI(ii,3);
+    bulap(ii,1:3) = BULAP(I,J,K,x,y,z,utempGFM,Dxyz,n,qd);
+    Repair(ii,1:5) = REPAIR(ii,JI,qd,n);
+    end
+
+    Repair=Repair';
+    for ii=n_intpts:-1:1
+        if Repair(1,ii)==-1
+        Repair(:,ii)=[];
+        end
+    end
+    Repair=Repair';
+    [Mrepair,~]=size(Repair);
+
+    for ii=1:Mrepair
+    bulap(Repair(ii,5),1:3)=BULAP(Repair(ii,2),Repair(ii,3),Repair(ii,4),x,y,z,utempGFM,Dxyz,n,qd);
+    end
+%__ Setup repair map for (bu_x)_x (bu_y)_y and (bu_z)_z
+
+
+% % %^^ K1 K2 are used to compute [u_x] [u_y] and [beta u_z]
+% % SN=zeros(n_intpts,6);        K1=zeros(n_intpts,6);        K2=zeros(n_intpts,6);
+% % %testbuxyz=zeros(n_intpts,6);
+% % for ii=1:n_intpts
+% %     I=JI(ii,1);     J=JI(ii,2);     K=JI(ii,3);
+% %     for jj=1:6
+% %         if JR(ii,jj)~=0
+% %             II=neighborindex(ii,jj,1);    JJ=neighborindex(ii,jj,2);    KK=neighborindex(ii,jj,3);
+% %             
+% %             SN(ii,jj)=(eq(jj,1)+eq(jj,2)+eq(jj,3))*sign(qd((I),(J),(K)))+(eq(jj,4)+eq(jj,5)+eq(jj,6))*sign(qd((II),(JJ),(KK)));
+% %             
+% % %             K1(ii,jj)=-intxyz(ii,jj,5)*(eq(jj,3)+eq(jj,4))-intxyz(ii,jj,6)*(eq(jj,2)+eq(jj,5))-intxyz(ii,jj,4)*(eq(jj,1)+eq(jj,6));
+% % %             K2(ii,jj)=-intxyz(ii,jj,6)*(eq(jj,3)+eq(jj,4))-intxyz(ii,jj,4)*(eq(jj,2)+eq(jj,5))-intxyz(ii,jj,5)*(eq(jj,1)+eq(jj,6));
+% % %             LGH(1:3)=intxyz(ii,jj,4:6);
+% % %             LGH=norm(LGH);
+% % %             K1(ii,jj)=K1(ii,jj)/LGH;
+% % %             K2(ii,jj)=K2(ii,jj)/LGH;
+% % % %             temptau(1:3)=tau1(ii,jj,1:3);
+% % % %             temptau=temptau/norm(temptau);
+% % % %             K1(ii,jj)=temptau*[(eq(jj,3)+eq(jj,4)) (eq(jj,2)+eq(jj,5)) (eq(jj,1)+eq(jj,6))]';
+% % % %             temptau(1:3)=tau2(ii,jj,1:3);
+% % % %             temptau=temptau/norm(temptau);
+% % % %             K2(ii,jj)=temptau*[(eq(jj,3)+eq(jj,4)) (eq(jj,2)+eq(jj,5)) (eq(jj,1)+eq(jj,6))]';
+% % 
+% %                 temptau1(1:3)=tau1(ii,jj,1:3);
+% %                 %temptau1=temptau1/norm(temptau1);
+% %                 temptau2(1:3)=tau2(ii,jj,1:3);
+% %                 %temptau2=temptau2/norm(temptau2);
+% %                 a=temptau1*temptau2';
+% %                 dir=4-min(jj,7-jj);
+% %                 K1(ii,jj)=( temptau1(dir) - a*temptau2(dir) )/(1-a^2);
+% %                 K2(ii,jj)=( temptau2(dir) - a*temptau1(dir) )/(1-a^2);
+% %         end
+% %     end
+% % end
+% % clear temptau
+% % %__ K1 K2 are used to compute [u_x] [u_y] and [beta u_z]
+
+
+
+
+%^^ Pre-Allocate
+    numofiter=zeros(1,MAXITER);         %errINT=zeros(1,MAXITER);
+    n_congraditer=zeros(1,MAXITER);     u_inf=zeros(1,MAXITER);
+    %errbutau1=zeros(1,MAXITER);         errbutau2=zeros(1,MAXITER);
+    %lap_error=zeros(1,MAXITER);
+    vcri=zeros(1,MAXITER);
+    bulap=zeros(n_intpts,3);
+    itercor=zeros(n_intpts,1);
+%-- Pre-Allocate
+ 
+%^^ Setup iterations
+    cri=dx*dz+1;        Fdiff=dx+1;     COUNT=0;
+    upre=uGFM;          PreF=F_GFM;
+    utemp=utempGFM;     Preutemp=utemp;
+%__ Setup iterations
+
+%^^ Setup repair map for (bu_x)_x (bu_y)_y and (bu_z)_z
+    Repair=zeros(n_intpts,5);
+    for ii=1:n_intpts
+    I=JI(ii,1);     J=JI(ii,2);     K=JI(ii,3);
+    bulap(ii,1:3)=BULAP(I,J,K,x,y,z,utemp,Dxyz,n,qd);
+    Repair(ii,1:5)=REPAIR(ii,JI,qd,n);
+    end
+
+    Repair=Repair';
+    for ii=n_intpts:-1:1
+        if Repair(1,ii)==-1
+        Repair(:,ii)=[];
+        end
+    end
+    Repair=Repair';
+    [Mrepair,~]=size(Repair);
+
+    for ii=1:Mrepair
+    bulap(Repair(ii,5),1:3)=BULAP(Repair(ii,2),Repair(ii,3),Repair(ii,4),x,y,z,utemp,Dxyz,n,qd);
+    end
+%__ Setup repair map for (bu_x)_x (bu_y)_y and (bu_z)_z
+ 
+ 
+%^^^^^^^^^^^^^^^^^^^^^^^^^^ Start Iterations!!!! ^^^^^^^^^^^^^^^^^^^^^^^^^^
+%^^^^^^^^^^^^^^^^^^^^^^^^^^ Start Iterations!!!! ^^^^^^^^^^^^^^^^^^^^^^^^^^
+%^^^^^^^^^^^^^^^^^^^^^^^^^^ Start Iterations!!!! ^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+RAT=1;
+while(cri>dx*dz || Fdiff>dx) && COUNT < MAXITER && niter~=0 && RAT > dx^2
+% while(cri>dx*dz) && COUNT < MAXITER && niter~=0 && RAT > dx^2
+%while cri>dx*dz && COUNT < MAXITER
+COUNT=COUNT+1;                  numofiter(COUNT)=COUNT;         Relaxation=0;
+
+%^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ Calculate interfacial values ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+for ii=1:n_intpts
+    I=JI(ii,1);     J=JI(ii,2);     K=JI(ii,3);
+    for jj=1:6
+        if JR(ii,jj)~=0 
+            
+            %Neighborpoint, Neighbor next point, and next to ijk point are needed
+            %In=neighborindex(ii,jj,1);      Jn=neighborindex(ii,jj,2);      Kn=neighborindex(ii,jj,3);
+            In = I + (jj==4) - (jj==3);     Jn = J + (jj==5) - (jj==2);     Kn = K + (jj==6) - (jj==1);
+
+            kk=min(jj,7-jj);
+            dir=4-kk;
+            
+            intx=intxyz(ii,jj,1);   inty=intxyz(ii,jj,2);   intz=intxyz(ii,jj,3);
+            xijk=( x(I) + intx )/2; yijk=( y(J) + inty )/2; zijk=( z(K) + intz )/2;
+            xnei=( x(In) + intx )/2;ynei=( y(Jn) + inty )/2;znei=( z(Kn) + intz )/2;
+
+            beta_ijk=BETA3d(xijk,yijk,zijk,dir,I,J,K,qd);        beta_nei=BETA3d(xnei,ynei,znei,dir,In,Jn,Kn,qd);
+                        
+%           Implicit Method
+            C=-bhat(ii,jj)*JR(ii,jj)*( 1 - JR(ii,jj) )/beta_nei/beta_ijk;
+            [M, NeiCor] = UintCor(n,I,J,K,In,Jn,Kn,jj,utemp,DM,Lr2,JR(ii,jj),qd(I,J,K),C);
+            uint(ii,jj) = bhat(ii,jj)*( JR(ii,jj)*utemp(l(I,J,K,n))/beta_nei + ...
+                                      ( 1 - JR(ii,jj) )*utemp(l(In,Jn,Kn,n))/beta_ijk )...
+                          +C*( ( bulap(ii,kk)*( 1 - JR(ii,jj) ) + bulap(enum_nei(ii,jj),kk)*JR(ii,jj) )*Dxyz(jj)^2/2 + ...
+                          NeiCor );
+            uint(ii,jj) = uint(ii,jj)/M;
+
+%           Tangential Based Calculation 
+%             uint(ii,jj)=bhat(ii,jj)*( JR(ii,jj)*utemp(l(I,J,K,n))/beta_nei +...
+%                                       ( 1 - JR(ii,jj) )*utemp(l(In,Jn,Kn,n))/beta_ijk )...
+%                         +C*(buxyz(ii,jj) + ( bulap(ii,kk)*( 1 - JR(ii,jj) ) + bulap(enum_nei(ii,jj),kk)*JR(ii,jj) )*Dxyz(jj)/2 )...
+%                         +intcor(ii,jj);
+                        % Note: intcor includes a_I and [beta u_n] corrections!
+        end
+    end
+end
+%-------------------------------------------- Calculate interfacial values  --------------------------------------------
+
+
+
+% % %^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ Calculate Bu_{tau}            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+% % % butau1 and butau2 now should be
+% % % \tau1\cdot[A\nabla \psi] and \tau2\cdot[A\nabla \psi] now
+% % 
+% % % ^^ Test with exact solution
+% % %     fprintf('Remember to turn off exact solution\n')
+% % %     fprintf('Press return\n')
+% % %     pause;
+% % %     [butau1,butau2]=...
+% % %     BUTAU(intxyz,utau1map,utau2map,JI,JR,uint,x,y,z,tau1,tau2,n_intpts,Exsol,Dxyz);
+% % % __ Test with exact solution
+% % 
+% % [butau1,butau2]=...
+% % BUTAU_QD(intxyz,utau1map,utau2map,JI,JR,uint,x,y,z,tau1,tau2,n_intpts,upre,Dxyz,qd);
+% % 
+% % 
+% % %For test purposes
+% % % max(max(abs(testbutau_n-butau1)))
+% % % max(max(abs(testbutau_n-butau2)))
+% % %For test purposes
+% % 
+% % 
+% % % badpts=sum(sum(TanMarker==1));
+% % % badpts2=sum(sum(TanMarker==0));
+% % % allpts=sum(sum(JR~=0));
+% % % allpts2=sum(sum(JR==0));
+% % % badptstotalpts=[badpts badpts2 allpts allpts2 n_intpts*6];
+% % 
+% % 
+% % buxyz=SN.*(K1.*butau1+K2.*butau2);
+% % % buxyz=SN.*(K1.*exbutau1+K2.*exbutau2);
+% % %-------------------------------------------- Calculate Bu_{tau}            --------------------------------------------
+
+%^^ Approximate buxyz with Cartesian derivatives, not using b_I
+for ii=1:n_intpts
+    I=JI(ii,1);     J=JI(ii,2);     K=JI(ii,3);
+    for jj=1:6
+        if JR(ii,jj)~=0
+            %Neighborpoint
+            In = I + (jj==4) - (jj==3);     Jn = J + (jj==5) - (jj==2);     Kn = K + (jj==6) - (jj==1);
+            buxyz(ii,jj) = BUXYZ(n,I,J,K,In,Jn,Kn,jj,utemp,uint(ii,jj),DM,Lr2,JR(ii,jj),qd(I,J,K),Dxyz);
+        end
+    end
+end
+
+%__ Approximate buxyz with Cartesian derivatives, not using b_I
+
+%^^ (bu_x)_x (bu_y)_y (bu_z)_z
+    for ii=1:n_intpts
+    I=JI(ii,1);     J=JI(ii,2);     K=JI(ii,3);
+    bulap(ii,1:3)=BULAP(I,J,K,x,y,z,utemp,Dxyz,n,qd);
+    end
+
+    for ii=1:Mrepair
+    bulap(Repair(ii,5),1:3)=BULAP(Repair(ii,2),Repair(ii,3),Repair(ii,4)...
+                                  ,x,y,z,utemp,Dxyz,n,qd);
+    end
+%__ (bu_x)_x (bu_y)_y (bu_z)_z
+
+%^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ F ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+for ii=1:n_intpts
+    chi=(JR(ii,1)+JR(ii,6));    zeta=(JR(ii,2)+JR(ii,5));   theta=(JR(ii,3)+JR(ii,4));
+    buyy=bulap(ii,2);           buxx=bulap(ii,3);
+    buzz=bulap(ii,1);           
+    
+    I=JI(ii,1);     J=JI(ii,2);     K=JI(ii,3);
+    
+    fijk=f3d(x(I),y(J),z(K),I,J,K,qd);
+    
+    itercor(ii)=ITERCOR(bhat,ii,neighborindex,enum_nei,JR,x,y,z,I,J,K,Dxyz,buxyz,bulap,intxyz,qd);
+	F(JL(ii)) = fijk - (buzz*chi+buyy*zeta+buxx*theta)/2 + itercor(ii); 
+    % Note: cor3d includes a_I and b_I so we don't need it with Cartesian [\psi_xyz]
+    
+    %itercor(ii)=ITERCOR(bhat,ii,neighborindex,enum_nei,JR,x,y,z,I,J,K,Dxyz,bulap,intxyz,qd);
+    %F(JL(ii)) = fijk - buzz*chi/2 + cor3d(ii) + itercor(ii); % Note: cor3d includes a_I and b_I
+    
+    
+    %TESTIterA(A, JL(ii), I, J, K, x,y,z, F( JL(ii) ), fijk, buzz, chi, cor3d(ii), itercor(ii), qd,intxyz,JI );
+ 
+end
+%------------------------------------ F -----------------------------------
+
+%^^ Solve with Adjusted F
+    %[utemp,~,~,niter]=pcg(-A,-F,dx*dy*dz,n^2);
+    %[utemp,~,~,niter]=pcg(-A,-F,10^-8,n^2);
+    [utemp,~,~,niter]=pcg(-A,-F,10^-8,n^2,[],[],Preutemp);                 %Use previous iteration as initial guess for Conjugat-Grad
+    fprintf('CG iteration count=%d\n',niter)
+    n_congraditer(COUNT)=niter;
+%--Solve with Adjusted F
+
+
+
+%^^ put solution back into 3D grid
+    for ii=1:nx-1
+        for jj=1:ny-1
+            for kk=1:nz
+            u(ii,jj,kk)=utemp(l(ii,jj,kk,n));
+            end
+        end
+    end 
+
+    u(n,:,:)=u(1,:,:);        %Assign (x=1 value) = (x=0 value)
+    u(:,n,:)=u(:,1,:);        %Assign (y=1 value) = (y=0 value)
+
+    shift=u(1,1,1)-Exsol(1,1,1);
+    u=u-shift*ones(nx,ny,nz);
+    utemp=utemp-shift*ones(Nl,1);
+%__ put solution back into 3D grid
+
+
+
+%^^^^^^^^^^^^^^^^^^^^^^^^^^^ Stopping criteria ^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+cri=max(max(max(abs(u-upre))));
+vcri(COUNT)=cri;
+ 
+ 
+%^^ Anderson Acceleration
+    if ANDERSON==1
+        if COUNT>2 && vcri(COUNT)>=vcri(COUNT-1)
+            RAT=myr*vcri(COUNT-1)/vcri(COUNT);
+            F=RAT*F+(1-RAT)*PreF;
+            u=RAT*u+(1-RAT)*upre;
+            utemp=RAT*utemp+(1-RAT)*Preutemp;
+            Relaxation=1;
+        end
+    end
+    %^^^^^^^ if Anderson is needed, values below need to be updated ^^^^^^^
+    cri=max(max(max(abs(u-upre))));     Fdiff=max(abs(F-PreF));
+    upre=u;
+    PreF=F;
+    Preutemp=utemp;
+    vcri(COUNT)=cri;
+    %------- if Anderson is needed, values below need to be updated -------
+ 
+    u_inf(COUNT)=max(max(max(abs(u-Exsol)))); 
+%-- Anderson Acceleration
+
+% % myinfo = [numofiter;vcri];
+
+%---------------------------- Stopping criteria ---------------------------
+
+% % if cri>1
+% %     if MACHINE==0
+% %     fileID = fopen('/Users/CNTZOU/Box Sync/Research_Code/Matlab/SSOFD_3D/failed_iterations_.txt','w');
+% %     save('/Users/CNTZOU/Box Sync/Research_Code/Matlab/SSOFD_3D/iteration_inf.mat', 'myinfo');
+% %     elseif MACHINE==1
+% %     fileID = fopen('/fac/cntzou/Documents/NewSSOFD_Linux/failed_iterations_.txt','w');
+% %     save('/fac/cntzou/Documents/MATLAB/NewSSOFD_Linux/iteration_inf.mat', 'myinfo');
+% %     end
+% %     fprintf(fileID,'n, u_n-u_n-1, u_inf, INTerr, laperr, errbutau1, errbutau2, cgiterations\n');
+% %     fprintf(fileID,'%d, %e, %e, %e, %e, %e, %e, %d\n',[numofiter;vcri;u_inf;errINT;lap_error;errbutau1;errbutau2;n_congraditer]);
+% %     fclose(fileID);
+% %     u=cri;
+% % return
+% % end
+ 
+%%%%%%%%%%%%%%%%% Print updated errors at each iteration %%%%%%%%%%%%%%%%%
+% % if MACHINE==0
+% % fileID = fopen('/Users/CNTZOU/Box Sync/Research_Code/Matlab/SSOFD_3D/success_iterations.txt','w');
+% % save('/Users/CNTZOU/Box Sync/Research_Code/Matlab/SSOFD_3D/iteration_inf.mat', 'myinfo');
+% % elseif MACHINE==1
+% % fileID = fopen('/fac/cntzou/Documents/NewSSOFD_Linux/success_iterations.txt','w');
+% % save('/fac/cntzou/Documents/NewSSOFD_Linux/iteration_inf.mat', 'myinfo');
+% % end
+% % fprintf(fileID,'n=%d,\n',n);
+% % fprintf(fileID,'n, u_n-u_n-1,     u_inf,        INTerr,       laperr,       errbutau1,    errbutau2,     cgiterations\n');
+% % fprintf(fileID,'%d, %e, %e, %e, %e, %e, %e, %e, %d\n',[numofiter;vcri;u_inf;errINT;lap_error;errbutau1;errbutau2;n_congraditer]);
+% %  
+% % fclose(fileID);
+%%%%%%%%%%%%%%%%% Print updated errors at each iteration %%%%%%%%%%%%%%%%%
+ 
+uerr1=sum(sum(sum(abs(u-Exsol))))*dx*dy*dz;                                 %L1 norm
+uerr2=sqrt(sum(sum(sum((u-Exsol).^2)))*dx*dy*dz);                           %L2 norm
+uerrinf=max(max(max(abs(u-Exsol))));                                        %L\inf norm
+  
+    if Relaxation==1
+    fprintf('Iteration#%3d. Errors are: Err_inf=%e, Err_1=%e, Err_2=%e\n',COUNT,uerrinf,uerr1,uerr2)
+    fprintf('cri=%e, Fdiff=%e, alpha=%e, Relaxed\n\n',vcri(COUNT),Fdiff,RAT)
+    else
+    fprintf('Iteration#%3d. Errors are: Err_inf=%e, Err_1=%e, Err_2=%e\n',COUNT,uerrinf,uerr1,uerr2)
+    fprintf('cri=%e, Fdiff=%e.\n\n',vcri(COUNT),Fdiff)
+    end
+ 
+end    %%while(cri>dx*dy)
+% fprintf('\n\n\n\n\nSTOPPED HERE\n\n\n\n\n')
+% return
+
+
+%------------------------ End Iterations!!!!!!!!!!! -----------------------
+%------------------------ End Iterations!!!!!!!!!!! -----------------------
+%------------------------ End Iterations!!!!!!!!!!! -----------------------
+ 
+fprintf('uiter errors are: Err_inf=%e, Err_1=%e, Err_2=%e.\n\n',...
+        uerrinf,uerr1,uerr2)
+%___________ Output error ___________
+ 
+ 
+ 
+ 
+
+% ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ Plotting ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+if(SHOW==1)
+
+upre=upre(:,:,round((n+1)/2));
+Exsol=Exsol(:,:,round((n+1)/2));
+upre=upre';
+Exsol=Exsol';
+
+%sz=size(upre)
+
+figure(1)
+%surf(x,y,upre,'Facecolor','interp');
+surf(x,y,upre,'Facecolor','[0.67 0.67 0.67]');
+axis([0 1 0 1 min(min(min(upre)),min(min(Exsol))) max(max(max(upre)),max(max(Exsol)))])
+xlabel('x','FontSize',10,'Fontname','Cambria')
+ylabel('y','FontSize',10,'Fontname','Cambria')
+zlabel('u','FontSize',10,'Fontname','Cambria')
+graphTitle=sprintf('%d', n);
+    h=figure(1);
+    title('Numerical solution');
+    if MACHINE==0
+    fileName=['/Users/CNTZOU/Box Sync/Research_Code/Matlab/SSOFD_3D/Numsol', graphTitle, '.epsc'];
+    elseif MACHINE==1
+    fileName=['/fac/cntzou/Documents/NewSSOFD_Linux/Numsol', graphTitle, '.epsc'];
+    end
+    print(h,'-depsc',fileName);
+    if MACHINE==0
+    fileName=['/Users/CNTZOU/Box Sync/Research_Code/Matlab/SSOFD_3D/Numsol', graphTitle, '.fig'];
+    elseif MACHINE==1
+    fileName=['/fac/cntzou/Documents/NewSSOFD_Linux/Numsol', graphTitle, '.fig'];
+    end
+    savefig(h,fileName); 
+clear h;
+ 
+figure(2)
+%surf(x,y,Exsol,'Facecolor','interp');
+surf(x,y,Exsol,'Facecolor','[0.67 0.67 0.67]');
+axis([0 1 0 1 min(min(min(upre)),min(min(Exsol))) max(max(max(upre)),max(max(Exsol)))])
+xlabel('x')
+ylabel('y')
+zlabel('Exact solution')
+    h=figure(2);
+    title('Exact solution');
+    if MACHINE==0
+    fileName=['/Users/CNTZOU/Box Sync/Research_Code/Matlab/SSOFD_3D/Exactsol', graphTitle, '.epsc'];
+    elseif MACHINE==1
+    fileName=['/fac/cntzou/Documents/NewSSOFD_Linux/Exactsol', graphTitle, '.epsc'];
+    end
+    print(h,'-depsc',fileName); 
+    if MACHINE==0
+    fileName=['/Users/CNTZOU/Box Sync/Research_Code/Matlab/SSOFD_3D/Exactsol', graphTitle, '.fig'];
+    elseif MACHINE==1
+    fileName=['/fac/cntzou/Documents/NewSSOFD_Linux/Exactsol', graphTitle, '.fig'];
+    end
+    savefig(h,fileName);
+    %saveas(h,fileName,fig); 
+clear h;
+  
+figure(3)
+%surf(x,y,upre-Exsol,'Facecolor','interp');
+surf(x,y,upre-Exsol,'Facecolor','[0.67 0.67 0.67]');
+xlabel('x')
+ylabel('y')
+zlabel('Error')
+    h=figure(3);
+    title('Error');
+    if MACHINE==0
+    fileName=['/Users/CNTZOU/Box Sync/Research_Code/Matlab/SSOFD_3D/Error', graphTitle, '.epsc'];
+    elseif MACHINE==1
+    fileName=['/fac/cntzou/Documents/NewSSOFD_Linux/Error', graphTitle, '.epsc'];
+    end
+    print(h,'-depsc',fileName);
+    if MACHINE==0
+    fileName=['/Users/CNTZOU/Box Sync/Research_Code/Matlab/SSOFD_3D/Error', graphTitle, '.fig'];
+    elseif MACHINE==1
+    fileName=['/fac/cntzou/Documents/NewSSOFD_Linux/Error', graphTitle, '.fig'];
+    end
+    savefig(h,fileName);
+end
+% ________________________________ Plotting _______________________________
+% u = [uerrinf, uerr1, uerr2, uinf_0, u1_0, u2_0, COUNT];
+
+if Showcount==1
+    if USEGFM == 1
+        fprintf('\n')
+        fprintf('|u_GFM-u_ex|:\n')
+        fprintf('Err_inf=%e, Err_1=%e, Err_2=%e\n',uinf_0,u1_0,u2_0)
+    end
+end
+fprintf('|u_num-u_ex|:\n')
+fprintf('Err_inf=%e, Err_1=%e, Err_2=%e\n\n',uerrinf,uerr1,uerr2)
+end
+% % End OF CODE
+ 
+function [A,F]=SymA3D(n,x,y,z,nx,ny,nz,Nl,qd,intxyz,JI)
+%% %--------- Symmetric Matrix A (Top)--------
+% tic
+ 
+dim=7*Nl;
+Aii=zeros(1,dim);       Ajj=zeros(1,dim);       Avv=zeros(1,dim);
+F=zeros(Nl,1);
+
+% dx=1/(nx-1);    dy=1/(ny-1);    dz=1/(nz-1);
+
+start1=1;
+
+% fprintf('Remember to turn off fixed C!!\n')
+% pause
+
+for ii=1:nx-1
+    for jj=1:ny-1
+        for kk=1:nz
+            C=Bcoef3d(ii,jj,kk,n,qd,intxyz,JI);
+           
+            iin=(ii-1)*(ii~=1)+(nx-1)*(ii==1);
+            iip=(ii+1)*(ii~=nx-1)+(ii==nx-1);
+            jjn=(jj-1)*(jj~=1)+(ny-1)*(jj==1);
+            jjp=(jj+1)*(jj~=ny-1)+(jj==ny-1);
+
+            kkn=(kk-1)*(kk~=1)+2*(kk==1);
+            kkp=(kk+1)*(kk~=nz)+(kk-1)*(kk==nz);
+            
+            if kk==1 || kk==nz
+                if kk==1
+                TempAjj=[l(ii,jjn,kk,n),l(iin,jj,kk,n),l(ii,jj,kk,n),...
+                        l(iip,jj,kk,n),l(ii,jjp,kk,n),l(ii,jj,kkp,n)];
+                TempAvv=[C(2),C(3),-sum(C),C(4),C(5),C(6)+C(1)];
+                else
+                TempAjj=[l(ii,jj,kkn,n),l(ii,jjn,kk,n),l(iin,jj,kk,n),l(ii,jj,kk,n),...
+                        l(iip,jj,kk,n),l(ii,jjp,kk,n)];
+                TempAvv=[C(6)+C(1),C(2),C(3),-sum(C),C(4),C(5)];
+                end
+                TempAvv=TempAvv/2;
+            else
+            TempAjj=[l(ii,jj,kkn,n),l(ii,jjn,kk,n),l(iin,jj,kk,n),l(ii,jj,kk,n),...
+                l(iip,jj,kk,n),l(ii,jjp,kk,n),l(ii,jj,kkp,n)];
+            TempAvv=[C(1),C(2),C(3),-sum(C),C(4),C(5),C(6)];
+            
+            % Test |Au - f| ~ 0?
+            %ErrA = ...
+            %TESTA( [ii, jj, kk, iin, iip, jjn, jjp, kkn, kkp] , TempAvv, f3d(x(ii),y(jj),z(kk),ii,jj,kk,qd), x, y, z, qd);
+            %fprintf('In test SymA, |Au - f| = %.4f\n', ErrA);
+            end
+            
+            Templ=length(TempAjj);
+            
+            Ajj(start1:start1+Templ-1)=TempAjj;
+            Avv(start1:start1+Templ-1)=TempAvv;
+            Aii(start1:start1+Templ-1)=l(ii,jj,kk,n)*ones(1,Templ);
+
+            start1=start1+Templ;
+            
+            
+            if kk==1 || kk==nz
+                F(l(ii,jj,kk,n))=f3d(x(ii),y(jj),z(kk),ii,jj,kk,qd)/2;
+            else
+                F(l(ii,jj,kk,n))=f3d(x(ii),y(jj),z(kk),ii,jj,kk,qd);
+            end
+            
+        end
+    end
+end
+Aii(start1:end)=[];
+Ajj(start1:end)=[];
+Avv(start1:end)=[];
+
+A = sparse(Aii,Ajj,Avv,Nl,Nl);
+
+% C=Bcoef3d(1,1,1,n);
+% 
+% A(1,1)=0;                   %Set u(0,0,0)=initial value
+% F(1,1)=F(1,1)-sum(C)/2*0;	%Set u(0,0,0)=initial value
+% toc
+%% %--------- Symmetric Matrix A (Bottom)--------
+end
+
+function label=l(ii,jj,kk,n)
+%Same as sub2ind([nx-1,ny-1,nz],ii,jj,kk)
+nx=n;   ny=n;   nz=n;
+if ii==nx
+    ii=1;
+end
+if jj==ny
+    jj=1;
+end
+
+label=sub2ind([nx-1,ny-1,nz],ii,jj,kk);
+% nx=n;
+% ny=n;
+% label=ii+(jj-1)*(nx-1)+(kk-1)*(nx-1)*(ny-1);
+end
+
+function [cor3d,intcor] = GFMCORS(JI,JR,effbeta,n_intpts,intxyz,x,y,z,qd)
+
+NOJUMP=1;
+
+cor3d=zeros(n_intpts,1);   intcor=zeros(n_intpts,6);
+%dx=x(2)-x(1);
+%dy=y(2)-y(1);
+dz=z(2)-z(1);
+
+for II=1:n_intpts
+    corb=0; cors=0; corw=0;
+    core=0; corn=0; cort=0;
+    chiB=JR(II,1);  %zetaS=JR(II,2); thetaW=JR(II,3);
+    chiT=JR(II,6);  %zetaN=JR(II,5); thetaE=JR(II,4);
+    ii=JI(II,1);    jj=JI(II,2);    kk=JI(II,3);
+
+    PC=qd((ii),(jj),(kk));
+    PB=qd((ii),(jj),(kk-1));     PS=qd((ii),(jj-1),(kk));     PW=qd((ii-1),(jj),(kk));
+    PE=qd((ii+1),(jj),(kk));     PN=qd((ii),(jj+1),(kk));     PT=qd((ii),(jj),(kk+1));
+
+    for JJ=1:5:6
+            %N1=intxyz(II,JJ,4); N2=intxyz(II,JJ,5); N3=intxyz(II,JJ,6);
+            
+        if JR(II,JJ)~=0
+        %if JR(II,1)~=0 || JR(II,6)~=0
+            
+            dir = 4-min(JJ,7-JJ);
+            
+            switch JJ
+                %%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+                case 1  %Bottom
+                ZI=intxyz(II,JJ,3);
+                BC=BETA3d( x(ii), y(jj) , (z(kk-1)+ZI)/2 , dir, ii,jj,kk-1,qd);
+                Bijk=BETA3d( x(ii), y(jj) , (z(kk)+ZI)/2 , dir, ii,jj,kk,qd);
+                bI = bj3d(x(ii),y(jj),ZI,intxyz);
+                
+                    if (PB>0) && (PC<=0)
+                    corb=( effbeta(II,1)*aj3d(x(ii),y(jj),ZI)-effbeta(II,1)*chiB*bI*dz/BC );
+                    elseif (PB<=0) && (PC>0)
+                    corb=( -effbeta(II,1)*aj3d(x(ii),y(jj),ZI)+effbeta(II,1)*chiB*bI*dz/BC );
+                    end
+                    
+                intcor(II,1)=-(1-chiB)*dz^2*corb/Bijk;
+                %%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+                case 6  %Top
+                ZI=intxyz(II,JJ,3);
+                BC=BETA3d(x(ii),y(jj), (z(kk+1)+ZI)/2 , dir, ii,jj,kk+1,qd);
+                Bijk=BETA3d(x(ii),y(jj), (z(kk)+ZI)/2 , dir, ii,jj,kk,qd);
+                bI = bj3d(x(ii),y(jj),ZI,intxyz);
+                
+                    if (PT>0) && (PC<=0)
+                    cort=( effbeta(II,6)*aj3d(x(ii),y(jj),ZI)+effbeta(II,6)*chiT*bI*dz/BC );
+                    elseif (PT<=0) && (PC>0)
+                    cort=( -effbeta(II,6)*aj3d(x(ii),y(jj),ZI)-effbeta(II,6)*chiT*bI*dz/BC );
+                    end
+                intcor(II,6)=-(1-chiT)*dz^2*cort/Bijk;
+                %%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+                case 2  %South
+                YI=intxyz(II,JJ,2);
+                BC=BETA3d(x(ii), (y(jj-1)+YI)/2 ,z(kk) , dir, ii,jj-1,kk,qd);
+                Bijk=BETA3d(x(ii), (y(jj)+YI)/2 ,z(kk) , dir, ii,jj,kk,qd);
+                
+                    if (PS>0) && (PC<=0)
+                    cors=( effbeta(II,2)*aj3d(x(ii),YI,z(kk))-effbeta(II,2)*zetaS*bj3d(x(ii),YI,z(kk),intxyz)*N2*dy/BC );
+                    elseif (PS<=0) && (PC>0)
+                    cors=( -effbeta(II,2)*aj3d(x(ii),YI,z(kk))+effbeta(II,2)*zetaS*bj3d(x(ii),YI,z(kk),intxyz)*N2*dy/BC );
+                    end
+                intcor(II,2)=-(1-zetaS)*dy^2*cors/Bijk;
+                %%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+                case 3  %West
+                XI=intxyz(II,JJ,1);
+                BC=BETA3d( (x(ii-1)+XI)/2 ,y(jj),z(kk) , dir, ii-1,jj,kk,qd);
+                Bijk=BETA3d( (x(ii)+XI)/2 ,y(jj),z(kk) , dir, ii,jj,kk,qd);
+                
+                if (PW>0) && (PC<=0)
+                corw=( effbeta(II,3)*aj3d(XI,y(jj),z(kk))-effbeta(II,3)*thetaW*bj3d(XI,y(jj),z(kk),intxyz)*N1*dx/BC );
+                elseif (PW<=0) && (PC>0)
+                corw=( -effbeta(II,3)*aj3d(XI,y(jj),z(kk))+effbeta(II,3)*thetaW*bj3d(XI,y(jj),z(kk),intxyz)*N1*dx/BC );
+                end
+                intcor(II,3)=-(1-thetaW)*dx^2*corw/Bijk;
+                %%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+                case 4  %East
+                XI=intxyz(II,JJ,1);
+                BC=BETA3d( (x(ii+1)+XI)/2 ,y(jj),z(kk) , dir, ii+1,jj,kk,qd);
+                Bijk=BETA3d( (x(ii)+XI)/2 ,y(jj),z(kk) , dir, ii,jj,kk,qd);
+                
+                    if (PE>0) && (PC<=0)
+                    core=( effbeta(II,4)*aj3d(XI,y(jj),z(kk))+effbeta(II,4)*thetaE*bj3d(XI,y(jj),z(kk),intxyz)*N1*dx/BC );
+                    elseif (PE<=0) && (PC>0)
+                    core=( -effbeta(II,4)*aj3d(XI,y(jj),z(kk))-effbeta(II,4)*thetaE*bj3d(XI,y(jj),z(kk),intxyz)*N1*dx/BC );
+                    end
+                intcor(II,4)=-(1-thetaE)*dx^2*core/Bijk;
+                %%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+                case 5  %North
+                YI=intxyz(II,JJ,2);
+                BC=BETA3d(x(ii), (y(jj+1)+YI)/2 ,z(kk) , dir, ii,jj+1,kk,qd);
+                Bijk=BETA3d(x(ii),(y(jj)+YI)/2,  z(kk) , dir, ii,jj,kk,qd);
+                
+                    if (PN>0) && (PC<=0)
+                    corn=( effbeta(II,5)*aj3d(x(ii),YI,z(kk))+effbeta(II,5)*zetaN*bj3d(x(ii),YI,z(kk),intxyz)*N2*dy/BC );
+                    elseif (PN<=0) && (PC>0)
+                    corn=( -effbeta(II,5)*aj3d(x(ii),YI,z(kk))-effbeta(II,5)*zetaN*bj3d(x(ii),YI,z(kk),intxyz)*N2*dy/BC );
+                    end
+                intcor(II,5)=-(1-zetaN)*dy^2*corn/Bijk;
+                %%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+            end
+        end
+    end
+    
+    if (corb==0 && cors==0 && corw==0 && core==0 && corn==0 && cort==0)
+        if NOJUMP==1
+            if II==1
+            fprintf('no jump, paused\n')
+            pause
+            end
+        else
+            fprintf('no corrections when there should be one cor!!!? enum=%d\n\n',II)
+            fprintf('[PC PB PS PW PE PN PT]=%d,%d,%d,%d,%d,%d,%d\n\n',[PC PB PS PW PE PN PT])
+            fprintf('Paused\n')
+            pause
+            return;
+        end
+    end
+    cor = [corb,cors,corw,core,corn,cort];
+    %cor = [corb,0,0,0,0,cort];
+    cor3d(II)=sum(cor);
+    
+end
+ 
+end
+ 
+% % FUNCTION Bcoef3d
+function Bcoef3d=Bcoef3d(ii,jj,kk,n,qd,intxyz,JI)
+nx=n;       ny=n;       nz=n;
+[xini, xter, yini, yter, zini, zter]=DOMAIN;
+dx=(xter-xini)/(nx-1);              %Width of space step(x)
+dy=(yter-yini)/(ny-1);              %Width of space step(y)
+dz=(zter-zini)/(nz-1);              %Width of space step(z)
+x=xini:dx:xter;                     %Range of x and specifying the grid points
+y=yini:dy:yter;                     %Range of x and specifying the grid points
+z=zini:dz:zter;                     %Range of z and specifying the grid points
+
+PC=qd((ii),(jj),(kk));
+if (ii~=1)*(ii~=nx)*(jj~=1)*(jj~=nx)*(kk~=1)*(kk~=nx)==1
+PB=qd((ii),(jj),(kk-1));     PT=qd((ii),(jj),(kk+1));
+PS=qd((ii),(jj-1),(kk));     PW=qd((ii-1),(jj),(kk));
+PE=qd((ii+1),(jj),(kk));     PN=qd((ii),(jj+1),(kk));
+
+idx = JI(:,1)==ii & JI(:,2)==jj & JI(:,3)==kk;
+
+else
+PB=PC;  PS=PC;  PW=PC;
+PE=PC;  PN=PC;  PT=PC;
+end
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+ 
+%bc=BETA3d(x(ii),y(jj),z(kk));
+%Bottom arm
+        if(PB*PC<=0)
+            zi=intxyz(idx,1,3);
+            chiB=abs(zi-z(kk-1))/dz;
+            bb=BETA3d(x(ii),y(jj),(z(kk-1)+zi)/2,3, ii,jj,kk-1,qd);
+            bc=BETA3d(x(ii),y(jj),( z(kk)+zi )/2,3, ii,jj,kk,qd);
+            Bcoef3d(1)=bb*bc/(bc*chiB+bb*(1-chiB));
+        else
+            Bcoef3d(1)=BETA3d(x(ii),y(jj),z(kk)-dz/2,3, ii,jj,kk,qd);
+        end
+        
+%South arm
+        if (PS*PC<=0)
+            yi=intxyz(idx,2,2);
+            zetaS=abs(yi-y(jj-1))/dy;
+            bs=BETA3d(x(ii),( y(jj-1) + yi)/2,z(kk),2, ii,jj-1,kk,qd);
+            bc=BETA3d(x(ii),( y(jj) + yi)/2,z(kk),2, ii,jj,kk,qd);
+            Bcoef3d(2)=bs*bc/(bc*zetaS+bs*(1-zetaS));
+        else
+            Bcoef3d(2)=BETA3d(x(ii),y(jj)-dy/2,z(kk),2, ii,jj,kk,qd);
+        end
+        
+%West arm
+        if(PW*PC<=0)
+            xi=intxyz(idx,3,1);
+            thetaW=abs(xi-x(ii-1))/dx;
+            bw=BETA3d(( x(ii-1) +xi )/2,y(jj),z(kk),1, ii-1,jj,kk,qd);
+            bc=BETA3d(( x(ii) + xi )/2,y(jj),z(kk),1, ii,jj,kk,qd);
+            Bcoef3d(3)=bw*bc/(bc*thetaW+bw*(1-thetaW));
+        else
+            Bcoef3d(3)=BETA3d(x(ii)-dx/2,y(jj),z(kk),1, ii,jj,kk,qd);
+        end
+        
+%East arm
+        if(PE*PC<=0)
+            xi=intxyz(idx,4,1);
+            thetaE=abs(x(ii+1)-xi)/dx;
+            be=BETA3d(( x(ii+1) +xi )/2,y(jj),z(kk),1, ii+1,jj,kk,qd);
+            bc=BETA3d(( x(ii) +xi )/2,y(jj),z(kk),1, ii,jj,kk,qd);
+            Bcoef3d(4)=be*bc/(bc*thetaE+be*(1-thetaE));
+        else
+            Bcoef3d(4)=BETA3d(x(ii)+dx/2,y(jj),z(kk),1, ii,jj,kk,qd);
+        end
+        
+%North arm
+        if(PN*PC<=0)
+            yi=intxyz(idx,5,2);
+            zetaN=abs(y(jj+1)-yi)/dy;
+            bn=BETA3d(x(ii),( y(jj+1)+yi )/2,z(kk),2, ii,jj+1,kk,qd);
+            bc=BETA3d(x(ii),( y(jj)+yi )/2,z(kk),2, ii,jj,kk,qd);
+            Bcoef3d(5)=bn*bc/(bc*zetaN+bn*(1-zetaN));
+        else
+            Bcoef3d(5)=BETA3d(x(ii),y(jj)+dy/2,z(kk),2, ii,jj,kk,qd);
+        end
+        
+%Top arm
+        if(PT*PC<=0)
+            zi=intxyz(idx,6,3);
+            chiT=abs(z(kk+1)-zi)/dz;
+            bt=BETA3d(x(ii),y(jj),( z(kk+1)+zi )/2,3, ii,jj,kk+1,qd);
+            bc=BETA3d(x(ii),y(jj),( z(kk)+zi )/2,3, ii,jj,kk,qd);
+            Bcoef3d(6)=bt*bc/(bc*chiT+bt*(1-chiT));
+        else
+            Bcoef3d(6)=BETA3d(x(ii),y(jj),z(kk)+dz/2,3, ii,jj,kk,qd);
+        end
+        
+        
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+% Why am I doing this??        
+%         if(thetaW*thetaE~=0 || zetaS*zetaW~=0 || chiB*chiT~=0)
+%             fprintf('The interface crosses an edge twice!!?\n\n')
+%         end
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+        Bcoef3d=Bcoef3d.*[1/dz^2,1/dy^2,1/dx^2,1/dx^2,1/dy^2,1/dz^2];
+        
+end
+ 
+ 
+function [ii,jj,kk]=nei_ind(j,I,J,K)
+        index=[I,J,K-1]*(j==1)+[I,J-1,K]*(j==2)+[I-1,J,K]*(j==3)+...
+              [I+1,J,K]*(j==4)+[I,J+1,K]*(j==5)+[I,J,K+1]*(j==6);
+        ii=index(1);    jj=index(2);    kk=index(3);
+end
+
+function itercor=ITERCOR(bhat,ii,neighborindex,enum_nei,JR,x,y,z,I,J,K,Dxyz,buxyz,bulap,intxyz,qd)
+%function itercor=ITERCOR(bhat,ii,neighborindex,enum_nei,JR,x,y,z,I,J,K,Dxyz,bulap,intxyz,qd)
+itercor=zeros(6,1);
+for jj=1:6
+    if JR(ii,jj)~=0
+        In=neighborindex(ii,jj,1);      Jn=neighborindex(ii,jj,2);      Kn=neighborindex(ii,jj,3);
+        XI=intxyz(ii,jj,1);             YI=intxyz(ii,jj,2);             ZI=intxyz(ii,jj,3);
+    
+        if qd((I),(J),(K))*qd((In),(Jn),(Kn))>0
+            fprintf('not crossing?\n')
+        end
+    
+        kk=min(jj,7-jj);
+        dir=4-kk;
+        
+        cint=bhat(ii,jj)*JR(ii,jj)/BETA3d( ( x(In)+XI)/2, ( y(Jn)+YI )/2 , ( z(Kn)+ZI )/2 ,dir, In,Jn,Kn,qd);
+        itercor(jj)=cint*( ( bulap(enum_nei(ii,jj),kk)*JR(ii,jj) + bulap(ii,kk)*( 1-JR(ii,jj) ) )/2 + buxyz(ii,jj)/Dxyz(jj) );
+%         if jj==1 || jj==6
+%             cint=bhat(ii,jj)*JR(ii,jj)/BETA3d( ( x(In)+XI)/2, ( y(Jn)+YI )/2 , ( z(Kn)+ZI )/2 ,dir, In,Jn,Kn,qd)/Dxyz(jj);
+%         else
+%             cint=JR(ii,jj)/Dxyz(jj);
+%         end
+        %itercor(jj)=cint*( ( bulap(enum_nei(ii,jj),kk)*JR(ii,jj) + bulap(ii,kk)*( 1-JR(ii,jj) ) )*Dxyz(jj)/2 );
+    end    
+end
+%itercor = [itercor(1), 0,0,0,0, itercor(6)];
+itercor = sum(itercor);
+end
+
+
+function Repair=REPAIR(ii,JI,qd,n)
+Repair=zeros(1,5);
+%for ii=1:n_intpts
+    
+    Repair(1)=ii;	Repair(5)=ii;                                           % Repair(1)=Standard point index;	Repair(5)=Original index;
+    
+    I=JI(ii,1);     J=JI(ii,2);     K=JI(ii,3);
+    Repair(2)=I;	Repair(3)=J;    Repair(4)=K;
+    
+    available=[];   ST=0;
+while isempty(available) == 1
+    
+    ST=ST+1;
+
+    X=max(I-ST,2):min(I+ST,n-1);
+    Y=max(J-ST,2):min(J+ST,n-1);
+    Z=max(K-ST,2):min(K+ST,n-1);
+
+    
+    [XX, YY, ZZ]=meshgrid(X,Y,Z);
+    
+    Xp=I-ST+1:I+ST+1;
+    Xn=I-ST-1:I+ST-1;
+    Yp=J-ST+1:J+ST+1;
+    Yn=J-ST-1:J+ST-1;
+    Zp=K-ST+1:K+ST+1;
+    Zn=K-ST-1:K+ST-1;
+        
+    sameregion=( qd(X,Y,Z)*qd((I),(J),(K)) > 0 );
+    available=sameregion.*( qd(X,Y,Z).*qd(X,Y,Zn) > 0 );
+    available=available.*( qd(X,Y,Z).*qd(X,Yn,Z) > 0 );
+    available=available.*( qd(X,Y,Z).*qd(Xn,Y,Z) > 0 );
+    available=available.*( qd(X,Y,Z).*qd(Xp,Y,Z) > 0 );
+    available=available.*( qd(X,Y,Z).*qd(X,Yp,Z) > 0 );
+    available=available.*( qd(X,Y,Z).*qd(X,Y,Zp) > 0 );
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%% For debug %%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+%%%%%%%%%%%%%%%%%%%%%%%%%% Move more than one step %%%%%%%%%%%%%%%%%%%%%%%%%%
+    if ST > 1
+        fprintf('ST=%d, available=%e %e %e\n%e %e %e\n%e %e %e\n',ST,available)
+        pause
+    end
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%% For debug %%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+    if max( max( max( available ) ) ) == 1
+        available=available.*( ( XX-(I)*ones(3,3,3) ).^2 + ( YY-(J)*ones(3,3,3) ).^2 + ( ZZ-(K)*ones(3,3,3) ).^2 );
+        mindist=min(available(available>0));
+        idx=find(available==mindist);
+        [locI, locJ, locK]=ind2sub([1+2*ST 1+2*ST 1+2*ST],idx);
+        
+        Repair(1)=0;
+        Repair(2)=I+locJ(1)-(1+ST);
+        Repair(3)=J+locI(1)-(1+ST);
+        Repair(4)=K+locK(1)-(1+ST);
+                
+        %badidx=find(JI(:,1)==Repair(2) & JI(:,2)==Repair(3) & JI(:,3)==Repair(4), 1 );
+        %badidx = JI(:,1)==Repair(2) & JI(:,2)==Repair(3) & JI(:,3)==Repair(4);
+        
+%         if isempty(badidx)~=1
+%         fprintf('neighbor point crosses interface?\n')
+%         end
+    end
+    
+end
+
+    
+end
+
+
+%^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ (bu_x)_x (bu_y)_y (bu_z)_z  ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+%function bulap=BULAP(ii,I,J,K,JR,x,y,z,utemp,Dxyz,n)
+function bulap=BULAP(I,J,K,x,y,z,utemp,Dxyz,n,qd)
+bulap=zeros(1,3);
+
+        for jj=1:3
+                u1=(eq(jj,3))*utemp(l(I+1,J,K,n))+(eq(jj,2))*utemp(l(I,J+1,K,n))+(eq(jj,1))*utemp(l(I,J,K+1,n));
+                u2=(eq(jj,3))*utemp(l(I-1,J,K,n))+(eq(jj,2))*utemp(l(I,J-1,K,n))+(eq(jj,1))*utemp(l(I,J,K-1,n));
+                uc=utemp(l(I,J,K,n));
+                b1=BETA3d(x(I)+Dxyz(jj)*(jj==3)/2,y(J)+Dxyz(jj)*(jj==2)/2,z(K)+Dxyz(jj)*(jj==1)/2 ,4-jj , I,J,K,qd);
+                b2=BETA3d(x(I)-Dxyz(jj)*(jj==3)/2,y(J)-Dxyz(jj)*(jj==2)/2,z(K)-Dxyz(jj)*(jj==1)/2 ,4-jj , I,J,K,qd);
+                bulap(jj)=(b1*(u1-uc)/Dxyz(jj)-b2*(uc-u2)/Dxyz(jj))/Dxyz(jj);
+        end
+
+% %-------------------------------------------- (bu_x)_x (bu_y)_y (bu_z)_z -------------------------------------------- 
+end
+%**************************** BOTTOM OF SHELL ****************************
+
+% function [aj3d]=aj3d(~,~,~)
+%     aj3d = 0;	%If solution is cts across interface
+% end
+
+% function bj3d=bj3d(x,y,z,~)
+%     [~, Lr, DM, ~] = PARMS;
+%     bj3d =  -Lr*( DM*CNT_qvs(x,y,z) - CNT_M(x,y,z) );
+%     bj3d1 = -sqrt(2)*sin(2*pi*x).*sin(2*pi*y).*sin(pi*z);
+%     
+%     if abs( bj3d - bj3d1 ) > 0.5
+%         fprintf('In bj3d\n')
+%         fprintf('difference in bj = %.4f\n', abs(bj3d-bj3d1))
+%         fprintf('[beta u_z] = %.8f, by div thm = %.8f\n', bj3d1 , bj3d )
+%         [x y z]
+%         EX_SGN(x,y,z)
+%         pause
+%     end
+% end
+
+function [bj3d]=bj3d(x,y,z,intxyz)
+    [Lr2, ~, DM, ~] = PARMS;
+
+    [Iidx,Jidx]=find(intxyz(:,:,1)==x & intxyz(:,:,2)==y & intxyz(:,:,3)==z);
+    if length(Iidx)>2 || length(Jidx)>2 || (length(Iidx)==2 && length(Jidx)==2 && sum(Jidx)~=7)
+        fprintf('interfacial points shared?\n')
+    elseif (length(Iidx)==2 && length(Jidx)==2 && max(abs(intxyz(Iidx(1),Jidx(1),4:6)-intxyz(Iidx(2),Jidx(2),4:6)))~=0)
+        fprintf('Different tangential?\n')
+        fprintf('I, J = %d, %d\n',Iidx, Jidx)
+        fprintf('x, y, z= %.1f, %.1f, %.1f\n',x,y,z)
+        
+        reshape(intxyz(Iidx(1),Jidx(1),1:3),1,[])
+        reshape(intxyz(Iidx(2),Jidx(2),1:3),1,[])
+        reshape(intxyz(Iidx(1),Jidx(1),4:6),1,[])
+        reshape(intxyz(Iidx(2),Jidx(2),4:6),1,[])
+
+        %pause
+        Iidx=Iidx(1);   Jidx=Jidx(1);
+    else
+        Iidx=Iidx(1);   Jidx=Jidx(1);
+    end
+    
+%     N1=intxyz(Iidx,Jidx,4);   N2=intxyz(Iidx,Jidx,5);   N3=intxyz(Iidx,Jidx,6);
+%     N3=intxyz(Iidx,Jidx,6);
+%     gradu=GRADU(x,y,z);
+%     bj3d =-N3*Lr2*gradu(3);
+    
+    N3=intxyz(Iidx,Jidx,6);
+    
+    % For test purposes
+%     	N1=intxyz(Iidx,Jidx,4);   N2=intxyz(Iidx,Jidx,5);   N3=intxyz(Iidx,Jidx,6);
+%     XI=intxyz(Iidx,Jidx,1);   YI=intxyz(Iidx,Jidx,2);   ZI=intxyz(Iidx,Jidx,3);    
+%     NOR = [2*XI-1, 2*YI-1, 2*ZI-1];
+%     NOR = NOR/norm(NOR);
+%     NOR3 = NOR(3);
+%     if abs(N3 - NOR3)>0.1
+%         [XI-x YI-y ZI-z]
+%         [N3 NOR(3)]
+%         [N1 N2 N3 ; NOR]
+%         0.25^2-(XI-0.5)^2-(YI-0.5)^2-(ZI-0.5)^2
+%         [XI YI ZI]
+%         fprintf('normal not correct\n')
+%         pause
+%     end
+    % For test purposes
+    %bj3d = -sqrt(Lr2)*( -DM*CNT_qvs(x,y,z) + CNT_M(x,y,z) );
+    NOR3 = N3;
+    bj3d = -(NOR3)*sqrt(Lr2)*( -DM*CNT_qvs(x,y,z) + CNT_M(x,y,z) );
+%     bj3d = 0;
+    
+    
+end
+
+% ^^^^^^^^^^^^^^^^^^^^^^^ Constant Coefficient Example ^^^^^^^^^^^^^^^^^^^
+% function exsol_n=EXSOL_N(x,y,z)
+% 
+% exsol_n=2*sqrt(2)*sin(2*pi*x).*sin(2*pi*y).*cos(pi*z)/pi;
+% 
+% end
+
+function exsol_p = EXSOL_P(x,y,z)
+exsol_p=2*sqrt(2)*sin(2*pi*x).*sin(2*pi*y).*cos(pi*z)/pi;
+end
+
+function Beta3d=BETA3d(x,y,z,dir,ii,jj,kk,qd)
+        Beta3d = BETAu(x,y,z,dir)*(qd(ii,jj,kk)<=0) + BETAs(x,y,z,dir)*(qd(ii,jj,kk)>0);
+%         Beta3d=BETAs(x,y,z,dir);
+end
+
+% function BETAu=BETAu(~,~,~,dir)
+%         [Lr2, ~, ~, ~] = PARMS;
+%         BETAu = (dir~=3) + Lr2*(dir==3);
+% end
+% 
+% function BETAs=BETAs(~,~,~,dir)
+%         [Lr2, ~, DM, ~] = PARMS;
+%         %BETAs=2;
+%         % With A=diag(1,1,(H_u+D_M*H_s)*(L/L_{du})^2)
+%         BETAs = (dir~=3) + DM*Lr2*(dir==3);
+% end
+
+function PV_u=PV_u(x,y,z)
+        PV_u=-17*sqrt(2)*pi*sin(2*pi*x).*sin(2*pi*y).*cos(pi*z);
+end
+
+function PV_s=PV_s(x,y,z)
+
+%     PV_s=-18*sqrt(2)*pi*sin(2*pi*x).*sin(2*pi*y).*cos(pi*z);
+
+    % PVs = \Delta_h(u) + Lr(\partial b_u/\partial z) 
+    [~, Lr, DM] = PARMS;
+    PV_s=-18*sqrt(2)*pi*sin(2*pi*x).*sin(2*pi*y).*cos(pi*z)...
+           + Lr*( DM*CNT_qvs_z(x,y,z) - CNT_M_z(x,y,z) );
+
+end
+
+function [f3d]=f3d(x,y,z,ii,jj,kk,qd)
+
+        % f_u = PV_u
+        % f_s = PV_s - Lr*( DM*CNT_qvs_z(x,y,z) - CNT_M_z(x,y,z) )
+        [~, Lr, DM] = PARMS;
+%         Interface approximated for PV and Jump conditions
+%         f3d= ( PV_s(x,y,z) - Lr*( DM*CNT_qvs_z(x,y,z) - CNT_M_z(x,y,z) ) )*(qd(ii,jj,kk)>0)...
+%              + PV_u(x,y,z)*(qd(ii,jj,kk)<=0);
+
+%         Exact interface for PV, approximated interface for Jump conditions
+        f3d= ( PV_s(x,y,z) )*(EX_SGN(x,y,z) > 0) - ( Lr*( DM*CNT_qvs_z(x,y,z) - CNT_M_z(x,y,z) ) )*(qd(ii,jj,kk)>0)...
+             + PV_u(x,y,z)*( 1 - (EX_SGN(x,y,z) > 0) );
+
+%         Exact interface for PV and Jump conditions
+%         f3d= ( PV_s(x,y,z) )*(EX_SGN(x,y,z) > 0) - ( Lr*( DM*CNT_qvs_z(x,y,z) - CNT_M_z(x,y,z) ) )*(EX_SGN(x,y,z)>0)...
+%              + PV_u(x,y,z)*(EX_SGN(x,y,z) < 0);
+
+
+end
+
+
+% function ErrA = TESTA( idxs , coef, fval, x, y, z, qd)
+% 
+% ii = idxs(1);   jj = idxs(2);   kk = idxs(3);
+% iin = idxs(4);	iip = idxs(5);
+% jjn = idxs(6);  jjp = idxs(7);
+% kkn = idxs(8);  kkp = idxs(9);
+% 
+% u_idxs = [ EXSOL_P( x(ii),y(jj),z(kkn) );...
+%            EXSOL_P( x(ii),y(jjn),z(kk) );...
+%            EXSOL_P( x(iin),y(jj),z(kk) );...
+%            EXSOL_P( x(ii),y(jj),z(kk)  );...
+%            EXSOL_P( x(iip),y(jj),z(kk) );...
+%            EXSOL_P( x(ii),y(jjp),z(kk) );...
+%            EXSOL_P( x(ii),y(jj),z(kkp) )];
+% ErrA = abs( coef*u_idxs - fval );
+% cross = ...
+% qd(ii,jj,kk)*[qd(ii, jj, kkn), qd(iin, jjn, kk), qd(iin, jj, kk), qd(iip, jj, kk) , qd(ii, jjp, kk), qd(ii, jj, kkp)];
+% cross = ( (cross < 0) + (cross == 0) );
+% 
+%     if ErrA > 5*( x(2)-x(1) ) && sum( cross ) == 0 && ErrA/abs(fval) > ( x(2)-x(1) )
+% %     if ErrA > 1 && sum( cross ) == 0
+%            fprintf('line 647\n')
+%            [~, Lr, DM] = PARMS;
+%            [ii jj kk]
+%            qd(ii,jj,kk)
+%            [qd(ii, jj, kkn), qd(iin, jjn, kk), qd(iin, jj, kk), qd(iip, jj, kk) , qd(ii, jjp, kk), qd(ii, jj, kkp)]
+%            cross
+%            coef
+%            -18*sqrt(2)*pi*sin(2*pi*x(ii)).*sin(2*pi*y(jj)).*cos(pi*z(kk))
+%            Lr*( DM*CNT_qvs_z(x(ii),y(jj),z(kk)) - CNT_M_z(x(ii),y(jj),z(kk)) )
+%         fprintf( 'Au = %.4f, f = %.4f, |Au - f| = %.4f, qd = %.4f\n', coef*u_idxs, fval, ErrA, qd(ii,jj,kk) )
+%         pause
+%     end
+% end
+% 
+% function ErrIterA = TESTIterA(A, JL, I, J, K, x,y,z, Fval, fijk, buzz, chi, cor3d, itercor,qd,intxyz,JI)
+%     
+%     Arow = A(JL,:);
+%     Arow = Arow(Arow~=0);
+%     Arow = full( reshape( Arow, 1, [] ) );
+%     
+% %     Acol = A(:,JL);
+% %     Acol = Acol(Acol~=0);
+% %     Acol = full( reshape( Acol, 1, [] ) );
+%     
+%     u_idxs = [ EXSOL_P( x(I),y(J),z(K-1) );...
+%                EXSOL_P( x(I),y(J-1),z(K) );...
+%                EXSOL_P( x(I-1),y(J),z(K) );...
+%                EXSOL_P( x(I),y(J),z(K)  );...
+%                EXSOL_P( x(I+1),y(J),z(K) );...
+%                EXSOL_P( x(I),y(J+1),z(K) );...
+%                EXSOL_P( x(I),y(J),z(K+1) )];
+% 	ErrIterA = abs(Arow*u_idxs - Fval);
+%     if ErrIterA > 5*( x(2)-x(1) ) && ErrIterA/abs(Fval) > 5*( x(2)-x(1) )
+%     %if ErrIterA > 1
+%     %if (I==10)*(J==10)*(K==6)==1
+%         fprintf( 'Line 381\n' )
+%         fprintf( 'Au=%.4f, f=%.4f, err=%.4f\n', Arow*u_idxs, Fval, abs(Arow*u_idxs - Fval) )
+%         fprintf( 'fijk, buzz, chi, cor3d, itercor= %.4f, %.4f, %.4f, %.4f, %.4f\n', fijk, buzz, chi, cor3d, itercor )
+%         fprintf( 'F = fijk - buzz*chi/2 + cor3d + itercor\n')
+%         u_idxs'
+%         Arow
+%         Bcoef3d(I,J,K,length(x),qd,intxyz,JI)
+%         [x(I) y(J) z(K)]
+%         
+%     pause
+%     end
+% end
+% function [f3d]=f3d(x,y,z,ii,jj,kk,qd)
+% 
+%         %f3d=fminus(x,y,z)*(EX_SGN(x,y,z)<=0)+fplus(x,y,z)*(EX_SGN(x,y,z)>0);
+%         f3d=fminus(x,y,z)*(qd(ii,jj,kk)>=0) + fplus(x,y,z)*(qd(ii,jj,kk)<0);
+% end
+
+% function [gradu_n,gradu_p]=GRADU(SIx,SIy,SIz)
+% gradu_n=[ 4*sqrt(2)*cos(2*pi*SIx).*sin(2*pi*SIy).*cos(pi*SIz),...
+%           4*sqrt(2)*sin(2*pi*SIx).*cos(2*pi*SIy).*cos(pi*SIz),...
+%          -2*sqrt(2)*sin(2*pi*SIx).*sin(2*pi*SIy).*sin(pi*SIz)];
+% gradu_p=[ 4*sqrt(2)*cos(2*pi*SIx).*sin(2*pi*SIy).*cos(pi*SIz),...
+%           4*sqrt(2)*sin(2*pi*SIx).*cos(2*pi*SIy).*cos(pi*SIz),...
+%          -2*sqrt(2)*sin(2*pi*SIx).*sin(2*pi*SIy).*sin(pi*SIz)];
+% end
+% ___________________ Constant Coefficient Example ___________________
